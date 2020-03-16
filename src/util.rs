@@ -4,13 +4,14 @@
 use rocket::fairing::{Fairing, Info, Kind};
 use rocket::http::{ContentType, Header, HeaderMap, Method, Status};
 use rocket::response::{self, Responder};
-use rocket::{Data, Request, Response, Rocket};
+use rocket::{Data, Request, Response, Manifest};
 use std::io::Cursor;
 
 use crate::CONFIG;
 
 pub struct AppHeaders();
 
+#[rocket::async_trait]
 impl Fairing for AppHeaders {
     fn info(&self) -> Info {
         Info {
@@ -19,7 +20,7 @@ impl Fairing for AppHeaders {
         }
     }
 
-    fn on_response(&self, _req: &Request, res: &mut Response) {
+    async fn on_response<'a>(&'a self, _req: &'a Request<'_>, res: &'a mut Response<'_>) {
         res.set_raw_header("Feature-Policy", "accelerometer 'none'; ambient-light-sensor 'none'; autoplay 'none'; camera 'none'; encrypted-media 'none'; fullscreen 'none'; geolocation 'none'; gyroscope 'none'; magnetometer 'none'; microphone 'none'; midi 'none'; payment 'none'; picture-in-picture 'none'; sync-xhr 'self' https://haveibeenpwned.com https://twofactorauth.org; usb 'none'; vr 'none'");
         res.set_raw_header("Referrer-Policy", "same-origin");
         res.set_raw_header("X-Frame-Options", "SAMEORIGIN");
@@ -53,6 +54,7 @@ impl CORS {
     }
 }
 
+#[rocket::async_trait]
 impl Fairing for CORS {
     fn info(&self) -> Info {
         Info {
@@ -61,7 +63,7 @@ impl Fairing for CORS {
         }
     }
 
-    fn on_response(&self, request: &Request, response: &mut Response) {
+    async fn on_response<'a>(&'a self, request: &'a Request<'_>, response: &'a mut Response<'_>) {
         let req_headers = request.headers();
 
         // We need to explicitly get the Origin header for Access-Control-Allow-Origin
@@ -70,15 +72,15 @@ impl Fairing for CORS {
         response.set_header(Header::new("Access-Control-Allow-Origin", req_allow_origin));
 
         if request.method() == Method::Options {
-            let req_allow_headers = CORS::get_header(req_headers, "Access-Control-Request-Headers");
-            let req_allow_method = CORS::get_header(req_headers, "Access-Control-Request-Method");
+            let req_allow_headers = CORS::get_header(&req_headers, "Access-Control-Request-Headers");
+            let req_allow_method = CORS::get_header(&req_headers, "Access-Control-Request-Method");
 
             response.set_header(Header::new("Access-Control-Allow-Methods", req_allow_method));
             response.set_header(Header::new("Access-Control-Allow-Headers", req_allow_headers));
             response.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
             response.set_status(Status::Ok);
             response.set_header(ContentType::Plain);
-            response.set_sized_body(Cursor::new(""));
+            response.set_sized_body(Cursor::new("")).await;
         }
     }
 }
@@ -97,15 +99,12 @@ impl<R> Cached<R> {
     }
 }
 
-impl<'r, R: Responder<'r>> Responder<'r> for Cached<R> {
-    fn respond_to(self, req: &Request) -> response::Result<'r> {
-        match self.0.respond_to(req) {
-            Ok(mut res) => {
-                res.set_raw_header("Cache-Control", self.1);
-                Ok(res)
-            }
-            e @ Err(_) => e,
-        }
+#[rocket::async_trait]
+impl<'r, R: 'r + Responder<'r> + Send> Responder<'r> for Cached<R> {
+    async fn respond_to(self, request: &'r Request<'_>) -> response::Result<'r> {
+        let mut res = self.0.respond_to(request).await?;
+        res.set_raw_header("Cache-Control", self.1);
+        Ok(res)
     }
 }
 
@@ -122,6 +121,7 @@ const LOGGED_ROUTES: [&str; 6] = [
 
 // Boolean is extra debug, when true, we ignore the whitelist above and also print the mounts
 pub struct BetterLogging(pub bool);
+#[rocket::async_trait]
 impl Fairing for BetterLogging {
     fn info(&self) -> Info {
         Info {
@@ -130,7 +130,7 @@ impl Fairing for BetterLogging {
         }
     }
 
-    fn on_launch(&self, rocket: &Rocket) {
+    fn on_launch(&self, rocket: &Manifest) {
         if self.0 {
             info!(target: "routes", "Routes loaded:");
             let mut routes: Vec<_> = rocket.routes().collect();
@@ -150,7 +150,7 @@ impl Fairing for BetterLogging {
         info!(target: "start", "Rocket has launched from {}", addr);
     }
 
-    fn on_request(&self, request: &mut Request<'_>, _data: &Data) {
+    async fn on_request<'a>(&'a self, request: &'a mut Request<'_>, _data: &'a Data) {
         let method = request.method();
         if !self.0 && method == Method::Options {
             return;
@@ -168,7 +168,7 @@ impl Fairing for BetterLogging {
         }
     }
 
-    fn on_response(&self, request: &Request, response: &mut Response) {
+    async fn on_response<'a>(&'a self, request: &'a Request<'_>, response: &'a mut Response<'_>) {
         if !self.0 && request.method() == Method::Options {
             return;
         }
@@ -177,7 +177,7 @@ impl Fairing for BetterLogging {
         let uri_subpath = request.uri().path().trim_start_matches(&CONFIG.domain_path());
         if self.0 || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
             let status = response.status();
-            if let Some(route) = request.route() {
+            if let Some(ref route) = request.route() {
                 info!(target: "response", "{} => {} {}", route, status.code, status.reason)
             } else {
                 info!(target: "response", "{} {}", status.code, status.reason)
@@ -204,6 +204,14 @@ pub fn read_file(path: &str) -> IOResult<Vec<u8>> {
     file.read_to_end(&mut contents)?;
 
     Ok(contents)
+}
+
+pub fn write_file(path: &str, content: &[u8]) -> Result<(), crate::error::Error> {
+    use std::io::Write;
+    let mut f = File::create(path)?;
+    f.write_all(content)?;
+    f.flush()?;
+    Ok(())
 }
 
 pub fn read_file_string(path: &str) -> IOResult<String> {

@@ -104,7 +104,7 @@ fn post_admin_login(data: Form<LoginForm>, mut cookies: Cookies, ip: ClientIp) -
 
         let cookie = Cookie::build(COOKIE_NAME, jwt)
             .path(admin_path())
-            .max_age(time::Duration::minutes(20))
+            .max_age(chrono::Duration::minutes(20))
             .same_site(SameSite::Strict)
             .http_only(true)
             .finish();
@@ -433,10 +433,11 @@ fn backup_db(_token: AdminToken) -> EmptyResult {
 
 pub struct AdminToken {}
 
+#[rocket::async_trait]
 impl<'a, 'r> FromRequest<'a, 'r> for AdminToken {
     type Error = &'static str;
 
-    fn from_request(request: &'a Request<'r>) -> request::Outcome<Self, Self::Error> {
+    async fn from_request(request: &'a Request<'r>) -> request::Outcome<Self, Self::Error> {
         if CONFIG.disable_admin_token() {
             Outcome::Success(AdminToken {})
         } else {
@@ -447,7 +448,7 @@ impl<'a, 'r> FromRequest<'a, 'r> for AdminToken {
                 None => return Outcome::Forward(()), // If there is no cookie, redirect to login
             };
 
-            let ip = match request.guard::<ClientIp>() {
+            let ip = match ClientIp::from_request(&request).await {
                 Outcome::Success(ip) => ip.ip,
                 _ => err_handler!("Error getting Client IP"),
             };
